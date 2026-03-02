@@ -1,1 +1,1 @@
-## enchnaced Expo Effect
+## enhanced Expo Effect
