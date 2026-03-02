@@ -1289,7 +1289,7 @@ HitInfo raycast_grid(const glm::vec3& ro, const glm::vec3& rd,
             if (program.get_program_id(wf::TEXTURE_TYPE_RGBA)==0)
                 load_program();
 
-            GL_CALL(glClearColor(0.05f,0.05f,0.09f,1.0f));
+            GL_CALL(glClearColor(0.0f,0.0f,0.0f,1.0f));
             GL_CALL(glClear(GL_COLOR_BUFFER_BIT));
             GL_CALL(glEnable(GL_BLEND));
             GL_CALL(glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA));
@@ -1313,37 +1313,101 @@ HitInfo raycast_grid(const glm::vec3& ro, const glm::vec3& rd,
             program.attrib_pointer("uvPosition", 2, 4*sizeof(GLfloat),
                                    (void*)(2*sizeof(GLfloat)));
 
-            for (int wy=gh-1; wy>=0; wy--) {
+/* Pass 1: draw non-target panels (back to front by depth) */
+            int target_idx = -1;
+           float oz    = cached_overview_z;
+            float cz    = zoom_anim.current_pos.z;
+            float close = calculate_close_z();
+            float t = std::clamp((oz-cz)/(oz-close), 0.0f, 1.0f);
+            float max_dist = std::sqrt(
+                (float)(gw * gw) + (float)(gh * gh));
+
+            /* Collect non-target panels sorted by depth (furthest first) */
+            struct PanelDraw {
+                int idx, wx, wy;
+                float depth;
+            };
+            std::vector<PanelDraw> panels;
+            panels.reserve(gw * gh);
+
+            for (int wy=0; wy<gh; wy++) {
                 for (int wx=0; wx<gw; wx++) {
                     int idx = wy*gw + wx;
-                    auto& st = states[idx];
-                    if (!st.allocated) continue;
+                    bool is_target = (wx==zoom_target_ws.x && wy==zoom_target_ws.y);
+                    if (is_target) { target_idx = idx; continue; }
 
-                    const glm::mat4& model = cached_models[idx];
+                    float dx = (float)wx - (float)zoom_target_ws.x;
+                    float dy = (float)wy - (float)zoom_target_ws.y;
+                    float dist = std::sqrt(dx*dx + dy*dy);
+                    float norm_dist = dist / std::max(max_dist, 1.0f);
+                    float delay = norm_dist * 0.3f;
+                    float local_t = std::clamp(
+                        (t - delay) / (1.0f - delay), 0.0f, 1.0f);
+                    float eased_t = local_t * local_t;
+                    float depth = eased_t * (1.0f + dist * 0.6f);
+                    panels.push_back({idx, wx, wy, depth});
+                }
+            }
+
+            /* Sort: deepest (most negative Z) drawn first */
+            std::sort(panels.begin(), panels.end(),
+                [](const PanelDraw& a, const PanelDraw& b) {
+                    return a.depth > b.depth;
+                });
+
+            /* Draw non-target panels */
+            for (auto& pd : panels) {
+                auto& st = states[pd.idx];
+                if (!st.allocated) continue;
+
+                const glm::mat4& model = cached_models[pd.idx];
+                glm::mat4 mvp = vp * model;
+
+                if (projected_quad_size_px(mvp,ow,oh) < CULL_PX) continue;
+
+                float bright = (pd.wx==selected_ws.x && pd.wy==selected_ws.y)
+                               ? 1.0f : 0.75f;
+
+                if (t > 0.01f) {
+                    float dx = (float)pd.wx - (float)zoom_target_ws.x;
+                    float dy = (float)pd.wy - (float)zoom_target_ws.y;
+                    float dist = std::sqrt(dx*dx + dy*dy);
+                    if (dist < 0.01f) { dx = 0; dy = 0; }
+                    else { dx /= dist; dy /= dist; }
+                    float norm_dist = dist / std::max(max_dist, 1.0f);
+                    float delay = norm_dist * 0.3f;
+                    float local_t = std::clamp(
+                        (t - delay) / (1.0f - delay), 0.0f, 1.0f);
+                    float eased_t = local_t * local_t;
+                    float slide = eased_t * (1.5f + dist * 0.8f);
+
+                    mvp = vp * glm::translate(model,
+                        glm::vec3(dx * slide, -dy * slide, -pd.depth));
+
+                    float fade = eased_t * (0.5f + norm_dist * 0.4f);
+                    bright *= std::max(0.0f, 1.0f - fade);
+                }
+
+                auto tex = wf::gles_texture_t::from_aux(st.fb);
+                GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
+                program.uniformMatrix4f("MVP", mvp);
+                program.uniform1f("u_brightness", bright);
+                GL_CALL(glDrawElements(GL_TRIANGLES, 6,
+                    GL_UNSIGNED_INT, nullptr));
+            }
+
+            /* Pass 2: draw target panel LAST (always on top) */
+            if (target_idx >= 0) {
+                auto& st = states[target_idx];
+                if (st.allocated) {
+                    const glm::mat4& model = cached_models[target_idx];
                     glm::mat4 mvp = vp * model;
-
-                    /* Cull sub-pixel panels (same as original) */
-                    if (projected_quad_size_px(mvp,ow,oh) < CULL_PX) continue;
-
-                    float bright = (wx==selected_ws.x && wy==selected_ws.y)
-                                   ? 1.0f : 0.75f;
-                    if (zoom_state==ZoomState::ZOOMING_IN ||
-                        zoom_state==ZoomState::ZOOMED_IN) {
-                        if (wx!=zoom_target_ws.x || wy!=zoom_target_ws.y) {
-                            float oz    = cached_overview_z;
-                            float cz    = zoom_anim.current_pos.z;
-                            float close = calculate_close_z();
-                            float t = std::clamp((oz-cz)/(oz-close),0.0f,1.0f);
-                            bright *= std::max(0.1f, 1.0f-t*0.8f);
-                        }
-                    }
+                    float bright = 1.0f;
 
                     auto tex = wf::gles_texture_t::from_aux(st.fb);
                     GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
                     program.uniformMatrix4f("MVP", mvp);
                     program.uniform1f("u_brightness", bright);
-
-                    /* OPT E: nullptr = indices from IBO */
                     GL_CALL(glDrawElements(GL_TRIANGLES, 6,
                         GL_UNSIGNED_INT, nullptr));
                 }
